@@ -1,0 +1,10 @@
+---
+# Версия ClickHouse
+clickhouse_version: "latest"
+
+# Версия Vector
+vector_version: "0.36.0"
+
+# Директории для Vector
+vector_install_dir: "/opt/vector"
+vector_config_dir: "/etc/vector"

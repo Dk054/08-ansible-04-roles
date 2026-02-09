@@ -1,0 +1,51 @@
+---
+- name: Create vector user
+  ansible.builtin.user:
+    name: vector
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Download and install Vector binary
+  ansible.builtin.shell: |
+    if [ ! -f /usr/local/bin/vector ]; then
+      wget -q https://packages.timber.io/vector/{{ vector_version }}/vector-{{ vector_version }}-x86_64-unknown-linux-musl.tar.gz -O /tmp/vector.tar.gz
+      tar -xzf /tmp/vector.tar.gz -C /tmp/
+      find /tmp -name "vector" -type f -exec cp {} /usr/local/bin/ \;
+      chmod +x /usr/local/bin/vector
+      echo "✅ Vector установлен"
+    else
+      echo "✅ Vector уже установлен"
+    fi
+    rm -rf /tmp/vector.tar.gz /tmp/vector-{{ vector_version }}* 2>/dev/null || true
+  args:
+    creates: /usr/local/bin/vector
+
+- name: Create config directory
+  ansible.builtin.file:
+    path: /etc/vector
+    state: directory
+    owner: vector
+    group: vector
+    mode: '0755'
+
+- name: Create vector config
+  ansible.builtin.copy:
+    dest: /etc/vector/vector.toml
+    content: |
+      [sources.demo]
+      type = "demo_logs"
+      format = "json"
+      
+      [sinks.console]
+      type = "console"
+      inputs = ["demo"]
+      encoding.codec = "json"
+    mode: '0644'
+
+- name: Start vector service
+  ansible.builtin.systemd:
+    name: vector
+    state: started
+    enabled: true
+    daemon_reload: true

@@ -1,0 +1,12 @@
+window.CONFIG = {
+  clickhouse: {
+    protocol: 'http',
+    host: '{{ clickhouse_host }}',
+    port: {{ clickhouse_port }},
+    user: '{{ clickhouse_user }}',
+    query_params: '',
+  },
+  graphs: {
+    type: 'clickhouse'
+  }
+};

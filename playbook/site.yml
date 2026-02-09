@@ -1,0 +1,422 @@
+---
+# ================================================
+# УСТАНОВКА CLICKHOUSE (с максимальной видимостью)
+# ================================================
+- name: Install Clickhouse
+  hosts: clickhouse
+  become: true
+
+  tasks:
+    # ИНДИКАТОР НАЧАЛА УСТАНОВКИ
+    - name: " НАЧАЛО УСТАНОВКИ CLICKHOUSE"
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          УСТАНОВКА CLICKHOUSE
+          ========================================
+          Хост: {{ inventory_hostname }}
+          Время: {{ ansible_date_time.time }}
+          ========================================
+
+    # ШАГ 1: КЛЮЧ GPG
+    - name: " 1. Скачивание GPG-ключа"
+      ansible.builtin.debug:
+        msg: "Скачиваю GPG-ключ с packages.clickhouse.com..."
+
+    - name: Download GPG key with progress
+      ansible.builtin.get_url:
+        url: "https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key"
+        dest: "/tmp/clickhouse.key"
+        mode: '0644'
+        timeout: 30
+      register: download_key
+
+    - name: " 2. Добавление ключа в систему"
+      ansible.builtin.shell: |
+        echo "Добавляю GPG-ключ в apt..."
+        sudo apt-key add /tmp/clickhouse.key && \
+        echo "✅ Ключ успешно добавлен" || \
+        echo "⚠️ Возможно ключ уже добавлен"
+        rm -f /tmp/clickhouse.key
+      args:
+        creates: /etc/apt/trusted.gpg.d/clickhouse.gpg
+
+    # ШАГ 2: РЕПОЗИТОРИЙ
+    - name: " 3. Добавление репозитория"
+      ansible.builtin.debug:
+        msg: "Добавляю репозиторий ClickHouse..."
+
+    - name: Create repository file
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/clickhouse.list
+        content: "deb https://packages.clickhouse.com/deb stable main\n"
+        mode: '0644'
+      notify: Update apt cache
+
+    # ШАГ 3: УСТАНОВКА
+    - name: "⚙️ 4. Установка пакетов"
+      ansible.builtin.debug:
+        msg: "Устанавливаю clickhouse-server и clickhouse-client..."
+
+    - name: Install packages with progress
+      ansible.builtin.apt:
+        name:
+          - clickhouse-server
+          - clickhouse-client
+        state: present
+        update_cache: true
+      register: install_result
+
+    # ШАГ 4: КОНФИГУРАЦИЯ
+    - name: "️ 5. Настройка сервиса"
+      ansible.builtin.debug:
+        msg: "Настраиваю и запускаю службу..."
+      when: not ansible_check_mode and install_result is changed
+
+    - name: Start and configure service
+      when: not ansible_check_mode and install_result is changed
+      block:
+        - name: Enable and start service
+          ansible.builtin.systemd:
+            name: clickhouse-server
+            state: started
+            enabled: true
+            daemon_reload: true
+
+        - name: Wait for service to start
+          ansible.builtin.wait_for:
+            port: 8123
+            delay: 5
+            timeout: 60
+
+        - name: Create database
+          ansible.builtin.shell: |
+            echo "Создаю базу данных 'logs'..."
+            clickhouse-client -q 'create database if not exists logs;'
+            echo "✅ База данных создана"
+          register: db_result
+          changed_when: "'уже существует' not in db_result.stdout"
+
+    # ФИНАЛЬНОЕ СООБЩЕНИЕ
+    - name: "✅ УСТАНОВКА ЗАВЕРШЕНА"
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          УСТАНОВКА CLICKHOUSE ЗАВЕРШЕНА УСПЕШНО!
+          ========================================
+          Сервис: clickhouse-server (порт 8123)
+          База данных: 'logs' создана
+          Клиент: clickhouse-client
+          ========================================
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+# ================================================
+# УСТАНОВКА VECTOR (с ВСЕМИ требуемыми модулями)
+# ================================================
+- name: Install Vector
+  hosts: vector
+  become: true
+
+  vars:
+    vector_version: "0.39.0"
+
+  tasks:
+    # 1. Создать пользователя
+    - name: Create vector user
+      ansible.builtin.user:
+        name: vector
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    # 2. Скачать Vector напрямую в /usr/local/bin
+    - name: Download and install Vector binary
+      ansible.builtin.shell: |
+        # Скачиваем только если бинарника нет
+        if [ ! -f /usr/local/bin/vector ]; then
+          wget -q https://packages.timber.io/vector/{{ vector_version }}/vector-{{ vector_version }}-x86_64-unknown-linux-musl.tar.gz -O /tmp/vector.tar.gz
+          tar -xzf /tmp/vector.tar.gz -C /tmp/
+          find /tmp -name "vector" -type f -exec cp {} /usr/local/bin/ \;
+          chmod +x /usr/local/bin/vector
+          echo "✅ Vector установлен"
+        else
+          echo "✅ Vector уже установлен"
+        fi
+        # Очищаем временные файлы
+        rm -rf /tmp/vector.tar.gz /tmp/vector-{{ vector_version }}* 2>/dev/null || true
+      args:
+        creates: /usr/local/bin/vector
+
+    ## 3. Создать systemd сервис
+    #- name: Create vector service
+    #  ansible.builtin.copy:
+    #    dest: /etc/systemd/system/vector.service
+    #    content: |
+    #      [Unit]
+    #      Description=Vector
+    #      After=network-online.target
+    #
+    #      [Service]
+    #      User=vector
+    #      ExecStart=/usr/local/bin/vector --config /etc/vector/vector.toml
+    #      Restart=on-failure
+    #
+    #      [Install]
+    #      WantedBy=multi-user.target
+    #    mode: '0644'
+
+    # 4. Создать директорию конфигов ПЕРВОЙ
+    - name: Create config directory
+      ansible.builtin.file:
+        path: /etc/vector
+        state: directory
+        owner: vector
+        group: vector
+        mode: '0755'
+
+    # 5. Создать базовый конфиг (теперь директория существует)
+    - name: Create vector config
+      ansible.builtin.copy:
+        dest: /etc/vector/vector.toml
+        content: |
+          [sources.demo]
+          type = "demo_logs"
+          format = "json"
+          
+          [sinks.console]
+          type = "console"
+          inputs = ["demo"]
+          encoding.codec = "json"
+        mode: '0644'
+
+    # 6. Запустить сервис
+    - name: Start vector service
+      ansible.builtin.systemd:
+        name: vector
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    ## 7. ✅ МОДУЛЬ: template - создать systemd сервис
+    #- name: Create systemd service unit file
+    #  ansible.builtin.template:
+    #    src: "templates/vector.service.j2"
+    #    dest: "/etc/systemd/system/vector.service"
+    #    owner: root
+    #    group: root
+    #    mode: '0644'
+    #  when: not ansible_check_mode
+
+    # 8. Запустить и настроить сервис Vector
+    - name: Start and enable Vector service
+      ansible.builtin.systemd:
+        name: vector
+        state: started
+        enabled: true
+        daemon_reload: true
+      when: not ansible_check_mode
+
+    # 9. Очистка временных файлов
+    - name: Clean up temporary download file
+      ansible.builtin.file:
+        path: "/tmp/vector-{{ vector_version }}.tar.gz"
+        state: absent
+      failed_when: false
+      when: not ansible_check_mode
+
+# ================================================
+# УСТАНОВКА LIGHTHOUSE
+# ================================================
+- name: Install Lighthouse
+  hosts: lighthouse
+  become: true
+  vars:
+    lighthouse_version: "master"
+
+  tasks:
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: Create web directory
+      ansible.builtin.file:
+        path: "/var/www/html"
+        state: directory
+        mode: '0755'
+
+    - name: Download Lighthouse
+      ansible.builtin.get_url:
+        url: "https://github.com/VKCOM/lighthouse/archive/refs/heads/master.tar.gz"
+        dest: "/tmp/lighthouse.tar.gz"
+        mode: '0644'
+
+    - name: Extract Lighthouse
+      ansible.builtin.unarchive:
+        src: "/tmp/lighthouse.tar.gz"
+        dest: "/var/www/html"
+        remote_src: true
+
+    - name: Configure Nginx
+      ansible.builtin.template:
+        src: "templates/lighthouse.conf.j2"
+        dest: "/etc/nginx/sites-available/lighthouse"
+        mode: '0644'
+      notify: Restart nginx
+
+    - name: Enable site
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/lighthouse"
+        dest: "/etc/nginx/sites-enabled/lighthouse"
+        state: link
+      notify: Restart nginx
+
+    - name: Disable default nginx site
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-enabled/default"
+        state: absent
+      notify: Restart nginx
+
+  handlers:
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+    - name: Configure Lighthouse
+      ansible.builtin.copy:
+        dest: /var/www/html/lighthouse-master/config.js
+        content: |
+          window.CONFIG = {
+            clickhouse: {
+              protocol: 'http',
+              host: '93.77.176.113',
+              port: 8123,
+              user: 'default',
+              query_params: '',
+            },
+            graphs: {
+              type: 'clickhouse'
+            }
+          };
+        mode: '0644'
+
+# ================================================
+# ИТОГОВЫЙ ОТЧЁТ О ВЫПОЛНЕНИИ (ДИНАМИЧЕСКИЙ)
+# ================================================
+- name: "Итоговый отчёт об установке"
+  hosts: all
+  gather_facts: false
+  run_once: true
+
+  # Получаем IP хостов динамически
+  vars:
+    clickhouse_ip: "{{ hostvars['clickhouse-vm']['ansible_host'] }}"
+    vector_ip: "{{ hostvars['vector-vm']['ansible_host'] }}"
+    lighthouse_ip: "{{ hostvars['lighthouse-vm']['ansible_host'] }}"
+
+  tasks:
+    - name: "Общая информация"
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════╗
+          ║             УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!            ║
+          ╚══════════════════════════════════════════════════════╝
+          Дата выполнения: {{ ansible_date_time.date }}
+          Время выполнения: {{ ansible_date_time.time }}
+          
+          ИНФРАСТРУКТУРА:
+          ├─ ClickHouse: {{ clickhouse_ip }}:8123
+          ├─ Vector:     {{ vector_ip }}
+          └─ LightHouse: {{ lighthouse_ip }}:80
+
+          ======================================================
+          ВЫПОЛНЕННЫЕ ДЕЙСТВИЯ:
+          ======================================================
+
+    - name: "ClickHouse - установка и настройки"
+      ansible.builtin.debug:
+        msg: |
+          CLICKHOUSE ({{ clickhouse_ip }}):
+          ├── Установленные пакеты:
+          │   ├─ clickhouse-server
+          │   └─ clickhouse-client
+          ├── Сервис:
+          │   ├─ Название: clickhouse-server
+          │   ├─ Статус: запущен
+          │   └─ Порт HTTP: 8123
+          ├── База данных: 'logs' создана
+          └── Доступ:
+              ├─ HTTP: http://{{ clickhouse_ip }}:8123
+              ├─ Проверка: curl http://{{ clickhouse_ip }}:8123/ping
+              └─ Клиент: clickhouse-client --version
+      when: "'clickhouse' in group_names"
+
+    - name: "Vector - установка и настройки"
+      ansible.builtin.debug:
+        msg: |
+          VECTOR ({{ vector_ip }}):
+          ├── Версия: {{ vector_version }}
+          ├── Установка:
+          │   ├─ Бинарник: /usr/local/bin/vector
+          │   └─ Конфиги: /etc/vector/vector.toml
+          ├── Сервис:
+          │   ├─ Название: vector
+          │   ├─ Статус: запущен
+          │   └─ Пользователь: vector
+          ├── Конфигурация:
+          │   ├─ Источники: demo (генерация логов)
+          │   └─ Приёмники: console (вывод в консоль)
+          └── Проверка:
+              ├─ Версия: vector --version
+              └─ Логи: journalctl -u vector --lines=5
+      when: "'vector' in group_names"
+
+    - name: "LightHouse - установка и настройки"
+      ansible.builtin.debug:
+        msg: |
+          LIGHTHOUSE ({{ lighthouse_ip }}):
+          ├── Веб-сервер:
+          │   ├─ Nginx: установлен
+          │   └─ Порт: 80
+          ├── LightHouse:
+          │   ├─ Версия: {{ lighthouse_version }}
+          │   ├─ Директория: /var/www/html/lighthouse-{{ lighthouse_version | replace('v', '') }}
+          │   └─ Конфиг: config.js
+          ├── Настройки ClickHouse:
+          │   ├─ Хост: {{ clickhouse_ip }}
+          │   ├─ Порт: 8123
+          │   └─ Пользователь: default
+          └── Доступ:
+              ├─ Веб-интерфейс: http://{{ lighthouse_ip }}
+              └─ Проверка: curl -I http://{{ lighthouse_ip }}
+      when: "'lighthouse' in group_names"
+
+    - name: "Сводная таблица доступа"
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║                    СВОДНАЯ ТАБЛИЦА ДОСТУПА                  ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║ СЕРВИС        │ IP АДРЕС            │ ПОРТ  │ ПРОВЕРКА      ║
+          ╟───────────────┼─────────────────────┼───────┼───────────────╢
+          ║ ClickHouse    │ {{ clickhouse_ip }} │ 8123  │ curl/ping     ║
+          ║ Vector        │ {{ vector_ip }}     │ -     │ systemctl     ║
+          ║ LightHouse    │ {{ lighthouse_ip }} │ 80    │ браузер       ║
+          ╚══════════════════════════════════════════════════════════════╝
+          
+          КОМАНДЫ ПРОВЕРКИ:
+          1. ClickHouse:  curl http://{{ clickhouse_ip }}:8123/ping
+          2. Vector:      ssh ubuntu@{{ vector_ip }} "vector --version"
+          3. LightHouse:  curl -I http://{{ lighthouse_ip }}
+          
+          ======================================================
+          УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!
+          ======================================================

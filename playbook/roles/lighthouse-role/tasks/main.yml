@@ -1,0 +1,50 @@
+---
+- name: Install Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: Create web directory
+  ansible.builtin.file:
+    path: "/var/www/html"
+    state: directory
+    mode: '0755'
+
+- name: Download Lighthouse
+  ansible.builtin.get_url:
+    url: "https://github.com/VKCOM/lighthouse/archive/refs/heads/master.tar.gz"
+    dest: "/tmp/lighthouse.tar.gz"
+    mode: '0644'
+
+- name: Extract Lighthouse
+  ansible.builtin.unarchive:
+    src: "/tmp/lighthouse.tar.gz"
+    dest: "/var/www/html"
+    remote_src: true
+
+- name: Configure Nginx for Lighthouse
+  ansible.builtin.template:
+    src: lighthouse.conf.j2
+    dest: "/etc/nginx/sites-available/lighthouse"
+    mode: '0644'
+  notify: Restart nginx
+
+- name: Enable Lighthouse site
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/lighthouse"
+    dest: "/etc/nginx/sites-enabled/lighthouse"
+    state: link
+  notify: Restart nginx
+
+- name: Disable default nginx site
+  ansible.builtin.file:
+    path: "/etc/nginx/sites-enabled/default"
+    state: absent
+  notify: Restart nginx
+
+- name: Configure Lighthouse connection to ClickHouse
+  ansible.builtin.template:
+    src: config.js.j2
+    dest: "/var/www/html/lighthouse-master/config.js"
+    mode: '0644'
